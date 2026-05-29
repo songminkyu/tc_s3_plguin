@@ -1,0 +1,5 @@
+[info]
+type=wfx
+
+[install]
+description=Total Commander S3 Plugin (C Implementation)

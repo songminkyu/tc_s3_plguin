@@ -1,0 +1,27 @@
+; plugin.def - Export definitions for TC S3 WFX Plugin
+; This file ensures correct stdcall decoration removal for MinGW builds
+LIBRARY tc_s3_plugin
+EXPORTS
+    FsInitW
+    FsGetDefRootName
+    FsFindFirstW
+    FsFindNextW
+    FsFindClose
+    FsGetFileW
+    FsPutFileW
+    FsDeleteFileW
+    FsMkDirW
+    FsRemoveDirW
+    FsRenMovFileW
+    FsExecuteFileW
+    FsExtractCustomIconW
+    FsStatusInfoW
+    FsSetCryptCallbackW
+    FsSetDefaultParams
+    FsDisconnectW
+    FsSetAttrW
+    FsSetTimeW
+    FsGetPreviewBitmapW
+    FsLinksToLocalFiles
+    FsGetLocalNameW
+    FsConnectW
