@@ -732,66 +732,131 @@ static void parse_prefix_cb(const char* inner, void* user) {
     }
 }
 
-/* ⭐️ [핵심 수정] AWS SigV4 규격을 완벽하게 따르도록 보정된 함수 */
-S3Object* s3_list_objects(S3Context* ctx, const char* bucket,
-                           const char* prefix, char delimiter) {
-    char query[1024] = { 0 };
-    
-    /* * [AWS SigV4 규격] Query 파라미터는 알파벳 순서(ASCII 바이트 순)로 정렬해야 합니다.
-     * 순서: delimiter -> list-type -> max-keys -> prefix
-     */
-    if (prefix && *prefix) {
+/* ════════════════════════════════════════════════
+   [수정본] S3 Object 리팅 (페이지네이션 및 SigV4 정렬 지원)
+   - 1,000개 이상의 대용량 파일/폴더가 있어도 끊기지 않고 전부 가져옵니다.
+   ════════════════════════════════════════════════ */
+S3Object* s3_list_objects(S3Context* ctx, const char* bucket, const char* prefix, char delimiter) {
+    S3Object* final_head = NULL;
+    char continuation_token[1024] = { 0 };
+    int is_truncated = 0;
+
+    // 대용량 디렉토리를 대비해 IsTruncated가 false가 될 때까지 반복 요청
+    do {
+        char query[2048] = { 0 };
         char enc_prefix[AWS_MAX_PATH_LEN * 3] = { 0 };
-        // prefix 경로의 '/' 문자가 %2F로 안전하게 인코딩되도록 규칙 지정
-        uri_encode(prefix, enc_prefix, sizeof(enc_prefix), 1);
-        
-        snprintf(query, sizeof(query), 
-                 "delimiter=%%2F&list-type=2&max-keys=1000&prefix=%s", 
-                 enc_prefix);
-    } else {
-        snprintf(query, sizeof(query), "delimiter=%%2F&list-type=2&max-keys=1000");
-    }
+        char enc_token[2048] = { 0 };
 
-    char* body = NULL;
-    DWORD status = 0;
-    SetLastError(0);
-    int ok = s3_http_request(ctx, bucket, NULL, query, "GET", NULL, 0, &body, &status);
-    DWORD win32_err = GetLastError();
-
-    if (!ok) {
-        char log_path[MAX_PATH];
-        GetTempPathA(MAX_PATH, log_path);
-        strncat(log_path, "tc_s3_error.txt", MAX_PATH - strlen(log_path) - 1);
-
-        FILE* f = fopen(log_path, "w");
-        if (f) {
-            fprintf(f,
-                "=== TC S3 Plugin: List Objects Error ===\n"
-                "Bucket    : %s\n"
-                "Prefix    : %s\n"
-                "Query     : %s\n"
-                "HTTP Status: %lu\n"
-                "Win32 Error: %lu (0x%08lX)\n"
-                "Response  :\n%s\n",
-                bucket,
-                prefix ? prefix : "(root)",
-                query,
-                status,
-                win32_err, win32_err,
-                body ? body : "(none - WinHTTP level failure)");
-            fclose(f);
+        if (prefix && *prefix) {
+            uri_encode(prefix, enc_prefix, sizeof(enc_prefix), 1);
         }
+
+        /* * [⚠️ AWS SigV4 중요 규칙] 
+         * Query Parameter는 반드시 알파벳(ASCII 바이트) 순서대로 정렬되어 정렬 스트링을 구성해야 합니다.
+         * 순서 규칙: continuation-token -> delimiter -> list-type -> max-keys -> prefix
+         */
+        if (continuation_token[0] != '\0') {
+            uri_encode(continuation_token, enc_token, sizeof(enc_token), 1);
+            
+            if (enc_prefix[0] != '\0') {
+                snprintf(query, sizeof(query),
+                         "continuation-token=%s&delimiter=%%2F&list-type=2&max-keys=1000&prefix=%s",
+                         enc_token, enc_prefix);
+            } else {
+                snprintf(query, sizeof(query),
+                         "continuation-token=%s&delimiter=%%2F&list-type=2&max-keys=1000",
+                         enc_token);
+            }
+        } else {
+            if (enc_prefix[0] != '\0') {
+                snprintf(query, sizeof(query),
+                         "delimiter=%%2F&list-type=2&max-keys=1000&prefix=%s",
+                         enc_prefix);
+            } else {
+                snprintf(query, sizeof(query), "delimiter=%%2F&list-type=2&max-keys=1000");
+            }
+        }
+
+        char* body = NULL;
+        DWORD status = 0;
+        SetLastError(0);
+        
+        // HTTP GET 요청 수행
+        int ok = s3_http_request(ctx, bucket, NULL, query, "GET", NULL, 0, &body, &status);
+        DWORD win32_err = GetLastError();
+
+        if (!ok || status != 200) {
+            // 디버깅 편의를 위해 에러 발생 시 환경 변수 Temp 폴더에 로그를 작성합니다.
+            char log_path[MAX_PATH];
+            if (GetTempPathA(MAX_PATH, log_path) > 0) {
+                strncat(log_path, "tc_s3_list_error.txt", MAX_PATH - strlen(log_path) - 1);
+                FILE* f = fopen(log_path, "w");
+                if (f) {
+                    fprintf(f, "=== Total Commander S3 Plugin: List Error ===\n");
+                    fprintf(f, "Bucket: %s\nPrefix: %s\nQuery: %s\nHTTP Status: %lu\nWin32 Err: 0x%08lX\n",
+                            bucket, prefix ? prefix : "(root)", query, status, win32_err);
+                    if (body) fprintf(f, "Response:\n%s\n", body);
+                    fclose(f);
+                }
+            }
+            free(body);
+            break; // 에러가 나면 루프를 탈출하고 지금까지 쌓인 리스트만이라도 반환 시도
+        }
+
+        // 현재 페이지 데이터 파싱 구조체 선언
+        ObjCtx oc = { NULL, prefix };
+        xml_iter(body, "Contents",     parse_content_cb, &oc);
+        xml_iter(body, "CommonPrefixes", parse_prefix_cb, &oc);
+
+        /* ─── XML 응답에서 Next Page 여부 및 토큰 검사 ─── */
+        char truncated_str[16] = { 0 };
+        if (xml_first(body, "IsTruncated", truncated_str, sizeof(truncated_str))) {
+            is_truncated = (strcmp(truncated_str, "true") == 0);
+        } else {
+            is_truncated = 0;
+        }
+
+        if (is_truncated) {
+            // 다음 토큰을 파싱하되, 실패 시 무한 루프 방지를 위해 플래그 해제
+            if (!xml_first(body, "NextContinuationToken", continuation_token, sizeof(continuation_token))) {
+                is_truncated = 0; 
+            }
+        }
+
         free(body);
-        return NULL;
+
+        /* ─── 현재 페이지에서 파싱된 노드 체인을 final_head 리스트에 병합 ─── */
+        if (oc.head) {
+            if (!final_head) {
+                final_head = oc.head;
+            } else {
+                // 기존 최종 리스트의 가장 마지막 노드(꼬리)를 찾아 이동
+                S3Object* tail = oc.head;
+                while (tail->next) {
+                    tail = tail->next;
+                }
+                // 기존 체인 앞에 새로운 리스트를 연결하거나 이어 붙임 
+                // (여기서는 기존 final_head를 새 노드들의 꼬리 뒤로 붙임)
+                tail->next = final_head;
+                final_head = oc.head;
+            }
+        }
+
+    } while (is_truncated);
+
+    /* * ─── 링크드 리스트 최종 반전(Reverse) 처리 ─── 
+     * 역순으로 누적된 결과를 Total Commander가 정상 출력할 수 있도록 올바른 정순으로 정렬합니다.
+     */
+    S3Object* prev = NULL;
+    S3Object* cur = final_head;
+    S3Object* next = NULL;
+    while (cur) { 
+        next = cur->next; 
+        cur->next = prev; 
+        prev = cur; 
+        cur = next; 
     }
-
-    ObjCtx oc = { NULL, prefix };
-    xml_iter(body, "Contents",     parse_content_cb, &oc);
-    xml_iter(body, "CommonPrefixes", parse_prefix_cb, &oc);
-    free(body);
-
-    S3Object* prev = NULL, *cur = oc.head, *next;
-    while (cur) { next = cur->next; cur->next = prev; prev = cur; cur = next; }
+    
     return prev;
 }
 
